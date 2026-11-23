@@ -69,6 +69,34 @@ u32 gss_unwrap(
 		int			offset,
 		int			len,
 		struct xdr_buf		*inbuf);
+
+/*
+ * Outcome of checking a received reply token.  GSS_RX_VERIFIED_EXPIRED
+ * means the mechanism completed every cryptographic check (and, for
+ * unwrap, left the buffer ready to decode), and only the context
+ * lifetime had passed.  It is reported only by mechanisms that say so
+ * explicitly; it does not by itself make a reply acceptable.
+ */
+enum gss_rx_verdict {
+	GSS_RX_INVALID,
+	GSS_RX_VERIFIED,
+	GSS_RX_VERIFIED_EXPIRED,
+};
+
+struct gss_rx_result {
+	u32			major_status;
+	enum gss_rx_verdict	verdict;
+};
+
+struct gss_rx_result gss_verify_mic_reply(
+		struct gss_ctx		*ctx_id,
+		struct xdr_buf		*message,
+		struct xdr_netobj	*mic_token);
+struct gss_rx_result gss_unwrap_reply(
+		struct gss_ctx		*ctx_id,
+		int			offset,
+		int			len,
+		struct xdr_buf		*inbuf);
 u32 gss_delete_sec_context(
 		struct gss_ctx		**ctx_id);
 
@@ -133,6 +161,16 @@ struct gss_api_ops {
 			struct xdr_buf		*buf);
 	void (*gss_delete_sec_context)(
 			void			*internal_ctx_id);
+	/* Optional: report verification and expiry separately. */
+	struct gss_rx_result (*gss_verify_mic_reply)(
+			struct gss_ctx		*ctx_id,
+			struct xdr_buf		*message,
+			struct xdr_netobj	*mic_token);
+	struct gss_rx_result (*gss_unwrap_reply)(
+			struct gss_ctx		*ctx_id,
+			int			offset,
+			int			len,
+			struct xdr_buf		*buf);
 };
 
 int gss_mech_register(struct gss_api_mech *);

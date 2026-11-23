@@ -330,6 +330,28 @@ static u32 gss_krb5_unwrap(struct gss_ctx *gctx, int offset,
 				  &gctx->slack, &gctx->align);
 }
 
+/*
+ * Reply variants: as gss_krb5_verify_mic and gss_krb5_unwrap, but a token
+ * that passed every cryptographic check on an expired context is
+ * reported as GSS_RX_VERIFIED_EXPIRED (unwrap: with @buf fully unwrapped).
+ */
+static struct gss_rx_result
+gss_krb5_verify_mic_reply(struct gss_ctx *gctx,
+			  struct xdr_buf *message_buffer,
+			  struct xdr_netobj *read_token)
+{
+	return gss_krb5_verify_mic_v2_reply(gctx->internal_ctx_id,
+					    message_buffer, read_token);
+}
+
+static struct gss_rx_result
+gss_krb5_unwrap_reply(struct gss_ctx *gctx, int offset, int len,
+		      struct xdr_buf *buf)
+{
+	return gss_krb5_unwrap_v2_reply(gctx->internal_ctx_id, offset, len,
+					buf, &gctx->slack, &gctx->align);
+}
+
 static const struct gss_api_ops gss_kerberos_ops = {
 	.gss_import_sec_context	= gss_krb5_import_sec_context,
 	.gss_get_mic		= gss_krb5_get_mic,
@@ -337,6 +359,8 @@ static const struct gss_api_ops gss_kerberos_ops = {
 	.gss_wrap		= gss_krb5_wrap,
 	.gss_unwrap		= gss_krb5_unwrap,
 	.gss_delete_sec_context	= gss_krb5_delete_sec_context,
+	.gss_verify_mic_reply	= gss_krb5_verify_mic_reply,
+	.gss_unwrap_reply	= gss_krb5_unwrap_reply,
 };
 
 static struct pf_desc gss_kerberos_pfs[] = {

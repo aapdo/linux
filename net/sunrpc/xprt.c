@@ -45,6 +45,7 @@
 #include <linux/workqueue.h>
 #include <linux/net.h>
 #include <linux/ktime.h>
+#include <linux/timekeeping.h>
 
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/metrics.h>
@@ -1973,6 +1974,63 @@ static void
 xprt_init_xid(struct rpc_xprt *xprt)
 {
 	xprt->xid = get_random_u32();
+}
+
+/**
+ * xprt_gss_clock_sample - read the clocks used by the GSS expired-reply rule
+ * @clk: filled in; @clk->valid is false unless all fields are set
+ *
+ * BOOTTIME is read between two REALTIME snapshots, and the reading is
+ * valid only if both snapshots are valid and the clock was not set in
+ * between.  @clk->real_ns is the later REALTIME reading, so it is never
+ * earlier than the instant @clk->boot_ns was read.
+ */
+void xprt_gss_clock_sample(struct rpc_gss_clock *clk)
+{
+	struct system_time_snapshot before, after;
+	u64 boot;
+
+	clk->valid = false;
+	ktime_get_snapshot_id(CLOCK_REALTIME, &before);
+	if (!before.valid)
+		return;
+	boot = ktime_get_boottime_ns();
+	ktime_get_snapshot_id(CLOCK_REALTIME, &after);
+	if (!after.valid ||
+	    after.clock_was_set_seq != before.clock_was_set_seq)
+		return;
+	clk->real_ns = ktime_to_ns(after.systime);
+	clk->boot_ns = boot;
+	clk->clock_set_seq = after.clock_was_set_seq;
+	clk->valid = true;
+}
+EXPORT_SYMBOL_GPL(xprt_gss_clock_sample);
+
+/**
+ * xprt_rqst_note_record_queued - the whole record of @req is in the socket
+ * @req: request whose newest encoded GSS sequence number it carries
+ *
+ * Only the first complete send of each encoded sequence number is kept.
+ *
+ * Serialization of rq_gss_tx[]: entries are shifted and created only by
+ * gss_marshal() in the owning task, and read only by that task while it
+ * decodes a reply.  This function runs in xprt_request_transmit() for
+ * whichever task holds the transport; xprt_transmit() pins @req for the
+ * whole send, and call_encode() waits in xprt_request_dequeue_xprt()
+ * until @req is unpinned before encoding again.  So rq_gss_tx[0] is the
+ * entry for the sequence number in rq_snd_buf and does not move while it
+ * is written.  Its fields are written once, before @queued is set with
+ * release semantics; a reader that acquires @queued == true sees them
+ * complete and they do not change until the owning task encodes again.
+ */
+void xprt_rqst_note_record_queued(struct rpc_rqst *req)
+{
+	struct rpc_gss_tx_stamp *tx = &req->rq_gss_tx[0];
+
+	if (!req->rq_seqno_count || READ_ONCE(tx->queued))
+		return;
+	xprt_gss_clock_sample(&tx->clock);
+	smp_store_release(&tx->queued, true);
 }
 
 static void

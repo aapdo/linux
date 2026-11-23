@@ -423,6 +423,45 @@ gss_unwrap(struct gss_ctx	*ctx_id,
 		->gss_unwrap(ctx_id, offset, len, buf);
 }
 
+/*
+ * gss_verify_mic_reply / gss_unwrap_reply: as gss_verify_mic / gss_unwrap,
+ * but also say whether the token was cryptographically verified.  A
+ * mechanism without the reply callbacks is only ever VERIFIED on
+ * GSS_S_COMPLETE; GSS_S_CONTEXT_EXPIRED from it stays INVALID.
+ */
+struct gss_rx_result
+gss_verify_mic_reply(struct gss_ctx		*ctx_id,
+		     struct xdr_buf		*message,
+		     struct xdr_netobj		*mic_token)
+{
+	const struct gss_api_ops *ops = ctx_id->mech_type->gm_ops;
+	struct gss_rx_result res = { .verdict = GSS_RX_INVALID };
+
+	if (ops->gss_verify_mic_reply)
+		return ops->gss_verify_mic_reply(ctx_id, message, mic_token);
+	res.major_status = ops->gss_verify_mic(ctx_id, message, mic_token);
+	if (res.major_status == GSS_S_COMPLETE)
+		res.verdict = GSS_RX_VERIFIED;
+	return res;
+}
+
+struct gss_rx_result
+gss_unwrap_reply(struct gss_ctx		*ctx_id,
+		 int			offset,
+		 int			len,
+		 struct xdr_buf		*buf)
+{
+	const struct gss_api_ops *ops = ctx_id->mech_type->gm_ops;
+	struct gss_rx_result res = { .verdict = GSS_RX_INVALID };
+
+	if (ops->gss_unwrap_reply)
+		return ops->gss_unwrap_reply(ctx_id, offset, len, buf);
+	res.major_status = ops->gss_unwrap(ctx_id, offset, len, buf);
+	if (res.major_status == GSS_S_COMPLETE)
+		res.verdict = GSS_RX_VERIFIED;
+	return res;
+}
+
 
 /* gss_delete_sec_context: free all resources associated with context_handle.
  * Note this differs from the RFC 2744-specified prototype in that we don't

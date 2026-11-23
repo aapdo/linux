@@ -48,6 +48,16 @@ u32 gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
 		       struct xdr_buf *buf, unsigned int *slack,
 		       unsigned int *align);
 
+struct gss_rx_result
+gss_krb5_verify_mic_v2_reply(struct krb5_ctx *ctx,
+			     struct xdr_buf *message_buffer,
+			     struct xdr_netobj *read_token);
+
+struct gss_rx_result
+gss_krb5_unwrap_v2_reply(struct krb5_ctx *kctx, int offset, int len,
+			 struct xdr_buf *buf, unsigned int *slack,
+			 unsigned int *align);
+
 /*
  * Implementation internal functions
  */

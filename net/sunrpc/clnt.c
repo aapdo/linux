@@ -2668,6 +2668,28 @@ rpc_check_timeout(struct rpc_task *task)
 }
 
 /*
+ * The auth flavor accepted the reply verifier only provisionally (see
+ * rq_verf_provisional) and then could not use the reply.  Without the
+ * provisional acceptance rpc_decode_header() would have refused the
+ * verifier as a stale credential: recover the same way, renewing the
+ * credential and resending with a new XID within the same retry budget.
+ */
+static void
+rpc_decode_stale_reply(struct rpc_task *task)
+{
+	rpcauth_invalcred(task);
+	if (!task->tk_cred_retry)
+		return;
+	task->tk_cred_retry--;
+	trace_rpc__stale_creds(task);
+	task->tk_status = 0;
+	task->tk_action = call_reserve;
+	rpc_check_timeout(task);
+	/* Ensure we obtain a new XID if we retry! */
+	xprt_release(task);
+}
+
+/*
  * 7.	Decode the RPC reply
  */
 static void
@@ -2721,6 +2743,8 @@ out:
 		task->tk_action = rpc_exit_task;
 		task->tk_status = rpcauth_unwrap_resp(task, &xdr);
 		xdr_finish_decode(&xdr);
+		if (unlikely(req->rq_gss_rx.retry_expired_reply))
+			rpc_decode_stale_reply(task);
 		return;
 	case -EAGAIN:
 		task->tk_status = 0;
@@ -2775,6 +2799,11 @@ rpc_decode_header(struct rpc_task *task, struct xdr_stream *xdr)
 	int error;
 	__be32 *p;
 
+	/* Nothing the auth flavor learned from an earlier reply carries over */
+	memset(&task->tk_rqstp->rq_gss_rx, 0,
+	       sizeof(task->tk_rqstp->rq_gss_rx));
+	task->tk_rqstp->rq_verf_provisional = false;
+
 	/* RFC-1014 says that the representation of XDR data must be a
 	 * multiple of four bytes
 	 * - if it isn't pointer subtraction in the NFS client may give
@@ -2796,20 +2825,21 @@ rpc_decode_header(struct rpc_task *task, struct xdr_stream *xdr)
 	if (error) {
 		struct rpc_cred *cred = task->tk_rqstp->rq_cred;
 
-		if (!test_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags)) {
-			rpcauth_invalcred(task);
-			if (!task->tk_cred_retry)
-				goto out_err;
-			task->tk_cred_retry--;
-			trace_rpc__stale_creds(task);
-			return -EKEYREJECTED;
-		}
+		if (!test_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags))
+			goto out_stale_cred;
 		goto out_verifier;
 	}
 
 	p = xdr_inline_decode(xdr, sizeof(*p));
 	if (!p)
 		goto out_unparsable;
+	/* A verifier the auth flavor accepted only provisionally (an expired
+	 * RPCSEC_GSS context) may complete a successful reply, nothing else:
+	 * handle any other reply as the stale credential it would have been. */
+	if (*p != rpc_success && task->tk_rqstp->rq_verf_provisional) {
+		error = -EACCES;
+		goto out_stale_cred;
+	}
 	switch (*p) {
 	case rpc_success:
 		return 0;
@@ -2848,7 +2878,18 @@ out_err:
 out_unparsable:
 	trace_rpc__unparsable(task);
 	error = -EIO;
+	/* Likewise for an unparsable reply after a provisional verifier. */
+	if (task->tk_rqstp->rq_verf_provisional)
+		goto out_stale_cred;
 	goto out_garbage;
+
+out_stale_cred:
+	rpcauth_invalcred(task);
+	if (!task->tk_cred_retry)
+		goto out_err;
+	task->tk_cred_retry--;
+	trace_rpc__stale_creds(task);
+	return -EKEYREJECTED;
 
 out_verifier:
 	trace_rpc_bad_verifier(task);

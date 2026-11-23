@@ -76,6 +76,16 @@ struct gss_cl_ctx {
 	struct xdr_netobj	gc_acceptor;
 	u32			gc_win;
 	unsigned long		gc_expiry;
+	/* Expired-reply exception, fixed when the context is imported.
+	 * gc_exc_end_* is the mechanism's end time on REALTIME and on
+	 * BOOTTIME, gc_exc_deadline_* that plus the grace period, all in
+	 * ns; gc_exc_clock_set_seq is the clock-was-set generation they
+	 * were computed in.  gc_exc_end_boot == 0: no exception. */
+	s64			gc_exc_end_real;
+	s64			gc_exc_deadline_real;
+	u64			gc_exc_end_boot;
+	u64			gc_exc_deadline_boot;
+	u32			gc_exc_clock_set_seq;
 	struct rcu_head		gc_rcu;
 };
 

@@ -28,6 +28,7 @@
 #include <linux/sunrpc/gss_api.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
+#include <linux/overflow.h>
 
 #include "auth_gss_internal.h"
 #include "../netns.h"
@@ -46,6 +47,11 @@ static unsigned int gss_expired_cred_retry_delay = GSS_RETRY_EXPIRED;
 
 #define GSS_KEY_EXPIRE_TIMEO 240
 static unsigned int gss_key_expire_timeo = GSS_KEY_EXPIRE_TIMEO;
+/* Seconds after the Kerberos end time during which a reply whose
+ * MIC/unwrap is cryptographically valid may still complete its request.
+ * Read once per context at import; 0 disables the exception. */
+#define GSS_EXPIRED_REPLY_GRACE_MAX 120
+static unsigned int gss_expired_reply_grace = 30;
 
 #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 # define RPCDBG_FACILITY	RPCDBG_AUTH
@@ -175,6 +181,48 @@ gss_alloc_context(void)
 }
 
 #define GSSD_MIN_TIMEOUT (60 * 60)
+
+/*
+ * Fix the expired-reply exception window when the context is imported:
+ * the mechanism's end time on REALTIME (as the mechanism itself checks
+ * it) and the same instant on BOOTTIME, each plus the grace period read
+ * now.  Both are checked later, and only while the clock-was-set
+ * generation is unchanged, so neither a forward nor a backward step of
+ * the wall clock can stretch the window.  Any doubt disables it.
+ */
+static void gss_set_expired_reply_window(struct gss_cl_ctx *ctx,
+					 time64_t krb_end)
+{
+	unsigned int grace = min_t(unsigned int,
+				   READ_ONCE(gss_expired_reply_grace),
+				   GSS_EXPIRED_REPLY_GRACE_MAX);
+	s64 grace_ns = (s64)grace * NSEC_PER_SEC;
+	s64 end_real, deadline_real, left;
+	u64 end_boot, deadline_boot;
+	struct rpc_gss_clock now;
+
+	ctx->gc_exc_end_boot = 0;
+	if (krb_end <= 0 || !grace)
+		return;
+	if (check_mul_overflow((s64)krb_end, (s64)NSEC_PER_SEC, &end_real) ||
+	    check_add_overflow(end_real, grace_ns, &deadline_real))
+		return;
+	/* now.real_ns is read after now.boot_ns, so end_boot is never late */
+	xprt_gss_clock_sample(&now);
+	if (!now.valid)
+		return;
+	if (check_sub_overflow(end_real, now.real_ns, &left) || left <= 0)
+		return;
+	if (check_add_overflow(now.boot_ns, (u64)left, &end_boot) ||
+	    check_add_overflow(end_boot, (u64)grace_ns, &deadline_boot))
+		return;
+	ctx->gc_exc_end_real = end_real;
+	ctx->gc_exc_deadline_real = deadline_real;
+	ctx->gc_exc_deadline_boot = deadline_boot;
+	ctx->gc_exc_clock_set_seq = now.clock_set_seq;
+	ctx->gc_exc_end_boot = end_boot;
+}
+
 static const void *
 gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx, struct gss_api_mech *gm)
 {
@@ -182,6 +230,7 @@ gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx, struct 
 	unsigned int seclen;
 	unsigned int timeout;
 	unsigned long now = jiffies;
+	time64_t krb_end = 0;
 	u32 window_size;
 	int ret;
 
@@ -227,12 +276,14 @@ gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx, struct 
 		p = ERR_PTR(-EFAULT);
 		goto err;
 	}
-	ret = gss_import_sec_context(p, seclen, gm, &ctx->gc_gss_ctx, NULL, GFP_KERNEL);
+	ret = gss_import_sec_context(p, seclen, gm, &ctx->gc_gss_ctx,
+				     &krb_end, GFP_KERNEL);
 	if (ret < 0) {
 		trace_rpcgss_import_ctx(ret);
 		p = ERR_PTR(ret);
 		goto err;
 	}
+	gss_set_expired_reply_window(ctx, krb_end);
 
 	/* is there any trailing data? */
 	if (q == end) {
@@ -1674,7 +1725,70 @@ gss_refresh_null(struct rpc_task *task)
 	return 0;
 }
 
-static u32
+static bool gss_use_reply_seqno(const struct gss_cl_ctx *ctx)
+{
+	return ctx->gc_proc == RPC_GSS_PROC_DATA;
+}
+
+/*
+ * The mechanism verified a reply token for @seqno and saw only that the
+ * context had expired.  The reply may still complete the request when
+ * every one of these holds now:
+ *  - the request is an RPCSEC_GSS DATA request and the context has an
+ *    exception window;
+ *  - @seqno is one of this request's encoded sequence numbers, and the
+ *    whole record carrying it was accepted by the local TCP socket before
+ *    the mechanism's end time on both REALTIME and BOOTTIME;
+ *  - it is no later than end time + grace on both clocks;
+ *  - the wall clock has not been set since the context was imported.
+ */
+static bool gss_reply_exception_allowed(const struct gss_cl_ctx *ctx,
+					const struct rpc_rqst *req, u32 seqno)
+{
+	const struct rpc_gss_tx_stamp *tx = NULL;
+	u32 cseq = ctx->gc_exc_clock_set_seq;
+	struct rpc_gss_clock now;
+	unsigned int i;
+
+	if (!gss_use_reply_seqno(ctx) || !ctx->gc_exc_end_boot)
+		return false;
+	for (i = 0; i < req->rq_seqno_count; i++)
+		if (req->rq_seqnos[i] == seqno) {
+			tx = &req->rq_gss_tx[i];
+			break;
+		}
+	if (!tx || !smp_load_acquire(&tx->queued) || !tx->clock.valid)
+		return false;
+	xprt_gss_clock_sample(&now);
+	if (!now.valid || tx->clock.clock_set_seq != cseq ||
+	    now.clock_set_seq != cseq)
+		return false;
+	if (tx->clock.real_ns >= ctx->gc_exc_end_real ||
+	    tx->clock.boot_ns >= ctx->gc_exc_end_boot)
+		return false;
+	return now.real_ns <= ctx->gc_exc_deadline_real &&
+	       now.boot_ns <= ctx->gc_exc_deadline_boot;
+}
+
+/*
+ * Final decision for a reply that saw an expired context, made once just
+ * before the RPC result is decoded: every check the service needs passed
+ * for the same sequence number, and the exception still holds.
+ */
+static bool gss_expired_reply_complete(const struct gss_cl_ctx *ctx,
+				       u32 service,
+				       const struct rpc_rqst *req)
+{
+	const struct rpc_gss_rx_state *rx = &req->rq_gss_rx;
+
+	if (!rx->header_verified)
+		return false;
+	if (service != RPC_GSS_SVC_NONE && !rx->body_verified)
+		return false;
+	return gss_reply_exception_allowed(ctx, req, rx->verified_seqno);
+}
+
+static struct gss_rx_result
 gss_validate_seqno_mic(struct gss_cl_ctx *ctx, u32 seqno, __be32 *seq, __be32 *p, u32 len)
 {
 	struct kvec iov;
@@ -1687,18 +1801,21 @@ gss_validate_seqno_mic(struct gss_cl_ctx *ctx, u32 seqno, __be32 *seq, __be32 *p
 	xdr_buf_from_iov(&iov, &verf_buf);
 	mic.data = (u8 *)p;
 	mic.len = len;
-	return gss_verify_mic(ctx->gc_gss_ctx, &verf_buf, &mic);
+	return gss_verify_mic_reply(ctx->gc_gss_ctx, &verf_buf, &mic);
 }
 
 static int
 gss_validate(struct rpc_task *task, struct xdr_stream *xdr)
 {
-	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
+	struct rpc_rqst *req = task->tk_rqstp;
+	struct rpc_cred *cred = req->rq_cred;
 	struct gss_cl_ctx *ctx = gss_cred_get_ctx(cred);
 	__be32		*p, *seq = NULL;
 	u32		len, maj_stat;
 	int		status;
 	int		i = 1; /* don't recheck the first item */
+	bool bind_seqno = gss_use_reply_seqno(ctx);
+	struct gss_rx_result res;
 
 	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
 	if (!p)
@@ -1712,17 +1829,31 @@ gss_validate(struct rpc_task *task, struct xdr_stream *xdr)
 	if (!p)
 		goto validate_failed;
 
+	if (bind_seqno && !req->rq_seqno_count)
+		goto validate_failed;
 	seq = kmalloc(4, GFP_KERNEL);
 	if (!seq)
 		goto validate_failed;
-	maj_stat = gss_validate_seqno_mic(ctx, task->tk_rqstp->rq_seqnos[0], seq, p, len);
+	res = gss_validate_seqno_mic(ctx, req->rq_seqnos[0], seq, p, len);
 	/* RFC 2203 5.3.3.1 - compute the checksum of each sequence number in the cache */
-	while (unlikely(maj_stat == GSS_S_BAD_SIG && i < task->tk_rqstp->rq_seqno_count))
-		maj_stat = gss_validate_seqno_mic(ctx, task->tk_rqstp->rq_seqnos[i++], seq, p, len);
+	while (unlikely(res.major_status == GSS_S_BAD_SIG && i < req->rq_seqno_count))
+		res = gss_validate_seqno_mic(ctx, req->rq_seqnos[i++], seq, p, len);
+	maj_stat = res.major_status;
 	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
 		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
-	if (maj_stat)
+	if (res.verdict == GSS_RX_VERIFIED_EXPIRED && bind_seqno &&
+	    gss_reply_exception_allowed(ctx, req, be32_to_cpup(seq))) {
+		/* Provisional: gss_unwrap_resp() decides, and only for a
+		 * reply that rpc_decode_header() finds successful. */
+		req->rq_gss_rx.expired_seen = true;
+		req->rq_verf_provisional = true;
+	} else if (res.verdict != GSS_RX_VERIFIED) {
 		goto bad_mic;
+	}
+	if (bind_seqno) {
+		req->rq_gss_rx.verified_seqno = be32_to_cpup(seq);
+		req->rq_gss_rx.header_verified = true;
+	}
 
 	/* We leave it to unwrap to calculate au_rslack. For now we just
 	 * calculate the length of the verifier: */
@@ -1991,7 +2122,9 @@ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
 		      struct xdr_stream *xdr)
 {
 	struct xdr_buf gss_data, *rcv_buf = &rqstp->rq_rcv_buf;
+	u32 expected_seqno = rqstp->rq_gss_rx.verified_seqno;
 	u32 len, offset, seqno, maj_stat;
+	struct gss_rx_result res;
 	struct xdr_netobj mic;
 	int ret;
 
@@ -2006,7 +2139,7 @@ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
 	offset = rcv_buf->len - xdr_stream_remaining(xdr);
 	if (xdr_stream_decode_u32(xdr, &seqno))
 		goto unwrap_failed;
-	if (seqno != *rqstp->rq_seqnos)
+	if (seqno != expected_seqno)
 		goto bad_seqno;
 	if (xdr_buf_subsegment(rcv_buf, &gss_data, offset, len))
 		goto unwrap_failed;
@@ -2033,11 +2166,15 @@ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
 	if (read_bytes_from_xdr_buf(rcv_buf, offset, mic.data, mic.len))
 		goto unwrap_failed;
 
-	maj_stat = gss_verify_mic(ctx->gc_gss_ctx, &gss_data, &mic);
+	res = gss_verify_mic_reply(ctx->gc_gss_ctx, &gss_data, &mic);
+	maj_stat = res.major_status;
 	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
 		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
-	if (maj_stat != GSS_S_COMPLETE)
+	if (res.verdict == GSS_RX_VERIFIED_EXPIRED)
+		rqstp->rq_gss_rx.expired_seen = true;
+	else if (res.verdict != GSS_RX_VERIFIED)
 		goto bad_mic;
+	rqstp->rq_gss_rx.body_verified = true;
 
 	gss_update_rslack(task, cred, 2, 2 + 1 + XDR_QUADLEN(mic.len));
 	ret = 0;
@@ -2050,7 +2187,7 @@ unwrap_failed:
 	trace_rpcgss_unwrap_failed(task);
 	goto out;
 bad_seqno:
-	trace_rpcgss_bad_seqno(task, *rqstp->rq_seqnos, seqno);
+	trace_rpcgss_bad_seqno(task, expected_seqno, seqno);
 	goto out;
 bad_mic:
 	trace_rpcgss_verify_mic(task, maj_stat);
@@ -2064,7 +2201,9 @@ gss_unwrap_resp_priv(struct rpc_task *task, struct rpc_cred *cred,
 {
 	struct xdr_buf *rcv_buf = &rqstp->rq_rcv_buf;
 	struct kvec *head = rqstp->rq_rcv_buf.head;
+	u32 expected_seqno = rqstp->rq_gss_rx.verified_seqno;
 	u32 offset, opaque_len, maj_stat;
+	struct gss_rx_result res;
 	__be32 *p;
 
 	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
@@ -2079,15 +2218,19 @@ gss_unwrap_resp_priv(struct rpc_task *task, struct rpc_cred *cred,
 	if (opaque_len <= GSS_KRB5_TOK_HDR_LEN)
 		goto unwrap_failed;
 
-	maj_stat = gss_unwrap(ctx->gc_gss_ctx, offset,
-			      offset + opaque_len, rcv_buf);
+	res = gss_unwrap_reply(ctx->gc_gss_ctx, offset,
+			       offset + opaque_len, rcv_buf);
+	maj_stat = res.major_status;
 	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
 		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
-	if (maj_stat != GSS_S_COMPLETE)
+	if (res.verdict == GSS_RX_VERIFIED_EXPIRED)
+		rqstp->rq_gss_rx.expired_seen = true;
+	else if (res.verdict != GSS_RX_VERIFIED)
 		goto bad_unwrap;
 	/* gss_unwrap decrypted the sequence number */
-	if (be32_to_cpup(p++) != *rqstp->rq_seqnos)
+	if (be32_to_cpup(p++) != expected_seqno)
 		goto bad_seqno;
+	rqstp->rq_gss_rx.body_verified = true;
 
 	/* gss_unwrap redacts the opaque blob from the head iovec.
 	 * rcv_buf has changed, thus the stream needs to be reset.
@@ -2102,7 +2245,7 @@ unwrap_failed:
 	trace_rpcgss_unwrap_failed(task);
 	return -EIO;
 bad_seqno:
-	trace_rpcgss_bad_seqno(task, *rqstp->rq_seqnos, be32_to_cpup(--p));
+	trace_rpcgss_bad_seqno(task, expected_seqno, be32_to_cpup(--p));
 	return -EIO;
 bad_unwrap:
 	trace_rpcgss_unwrap(task, maj_stat);
@@ -2164,6 +2307,8 @@ gss_unwrap_resp(struct rpc_task *task, struct xdr_stream *xdr)
 
 	if (ctx->gc_proc != RPC_GSS_PROC_DATA)
 		goto out_decode;
+	if (!rqstp->rq_gss_rx.header_verified)
+		goto out;
 	switch (gss_cred->gc_service) {
 	case RPC_GSS_SVC_NONE:
 		status = gss_unwrap_resp_auth(task, cred);
@@ -2175,8 +2320,23 @@ gss_unwrap_resp(struct rpc_task *task, struct xdr_stream *xdr)
 		status = gss_unwrap_resp_priv(task, cred, ctx, rqstp, xdr);
 		break;
 	}
-	if (status)
+	if (status) {
+		/* Without the exception the provisionally accepted verifier
+		 * would have been refused as a stale credential: recover the
+		 * same way (see call_decode()). */
+		if (rqstp->rq_verf_provisional)
+			rqstp->rq_gss_rx.retry_expired_reply = true;
 		goto out;
+	}
+	/* A reply that saw an expired context is used only if the exception
+	 * still holds now.  Otherwise it is handled like a verifier refused
+	 * for an expired context: renew the credential and resend. */
+	if (rqstp->rq_gss_rx.expired_seen &&
+	    !gss_expired_reply_complete(ctx, gss_cred->gc_service, rqstp)) {
+		rqstp->rq_gss_rx.retry_expired_reply = true;
+		status = -EIO;
+		goto out;
+	}
 
 out_decode:
 	status = rpcauth_unwrap_resp_decode(task, xdr);
@@ -2305,6 +2465,15 @@ module_param_named(key_expire_timeo,
 MODULE_PARM_DESC(key_expire_timeo, "Time (in seconds) at the end of a "
 		"credential keys lifetime where the NFS layer cleans up "
 		"prior to key expiration");
+
+module_param_named(expired_reply_grace,
+		   gss_expired_reply_grace,
+		   uint, 0644);
+MODULE_PARM_DESC(expired_reply_grace, "Seconds after the Kerberos context "
+		"end time during which a cryptographically verified reply to "
+		"a request fully queued before that end time completes the "
+		"request instead of being resent (0 disables, max 120; read "
+		"when a context is created)");
 
 module_init(init_rpcsec_gss)
 module_exit(exit_rpcsec_gss)

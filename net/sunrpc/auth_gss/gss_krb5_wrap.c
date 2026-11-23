@@ -141,10 +141,17 @@ gss_krb5_wrap_v2(struct krb5_ctx *kctx, int offset,
 	return (kctx->endtime < now) ? GSS_S_CONTEXT_EXPIRED : GSS_S_COMPLETE;
 }
 
-u32
-gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
-		   struct xdr_buf *buf, unsigned int *slack,
-		   unsigned int *align)
+/*
+ * With @reply_expired NULL this is the strict unwrap: on an expired
+ * context it fails after decryption and before the final XDR unwrap
+ * cleanup, as before.  Otherwise the authenticated token is fully
+ * unwrapped and *@reply_expired says whether the context lifetime had
+ * passed.
+ */
+static u32
+__gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
+		     struct xdr_buf *buf, unsigned int *slack,
+		     unsigned int *align, bool *reply_expired)
 {
 	time64_t	now;
 	u8		*ptr;
@@ -154,6 +161,7 @@ gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
 	u32		headskip, tailskip;
 	u8		decrypted_hdr[GSS_KRB5_TOK_HDR_LEN];
 	unsigned int	movelen;
+	bool		expired;
 
 
 	dprintk("RPC:       %s\n", __func__);
@@ -216,7 +224,8 @@ gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
 
 	/* it got through unscathed.  Make sure the context is unexpired */
 	now = ktime_get_real_seconds();
-	if (now > kctx->endtime)
+	expired = now > kctx->endtime;
+	if (expired && !reply_expired)
 		return GSS_S_CONTEXT_EXPIRED;
 
 	/*
@@ -241,5 +250,39 @@ gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
 
 	*align = XDR_QUADLEN(GSS_KRB5_TOK_HDR_LEN + headskip);
 	*slack = *align + XDR_QUADLEN(ec + GSS_KRB5_TOK_HDR_LEN + tailskip);
+	if (reply_expired)
+		*reply_expired = expired;
 	return GSS_S_COMPLETE;
+}
+
+u32
+gss_krb5_unwrap_v2(struct krb5_ctx *kctx, int offset, int len,
+		   struct xdr_buf *buf, unsigned int *slack,
+		   unsigned int *align)
+{
+	return __gss_krb5_unwrap_v2(kctx, offset, len, buf, slack, align,
+				    NULL);
+}
+
+/* As gss_krb5_unwrap_v2(), but report a verified, fully unwrapped token
+ * separately from the context lifetime. */
+struct gss_rx_result
+gss_krb5_unwrap_v2_reply(struct krb5_ctx *kctx, int offset, int len,
+			 struct xdr_buf *buf, unsigned int *slack,
+			 unsigned int *align)
+{
+	struct gss_rx_result res = { .verdict = GSS_RX_INVALID };
+	bool expired = false;
+
+	res.major_status = __gss_krb5_unwrap_v2(kctx, offset, len, buf,
+						slack, align, &expired);
+	if (res.major_status != GSS_S_COMPLETE)
+		return res;
+	if (expired) {
+		res.major_status = GSS_S_CONTEXT_EXPIRED;
+		res.verdict = GSS_RX_VERIFIED_EXPIRED;
+	} else {
+		res.verdict = GSS_RX_VERIFIED;
+	}
+	return res;
 }

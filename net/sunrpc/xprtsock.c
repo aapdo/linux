@@ -1158,6 +1158,7 @@ static int xs_tcp_send_request(struct rpc_rqst *req)
 		if (likely(req->rq_bytes_sent >= msglen)) {
 			req->rq_xmit_bytes_sent += transport->xmit.offset;
 			transport->xmit.offset = 0;
+			xprt_rqst_note_record_queued(req);
 			if (atomic_long_read(&xprt->xmit_queuelen) == 1)
 				tcp_sock_set_cork(transport->inet, false);
 			return 0;

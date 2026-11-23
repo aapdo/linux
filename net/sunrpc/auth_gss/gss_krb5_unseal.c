@@ -69,9 +69,10 @@
 # define RPCDBG_FACILITY        RPCDBG_AUTH
 #endif
 
-u32
-gss_krb5_verify_mic_v2(struct krb5_ctx *ctx, struct xdr_buf *message_buffer,
-		       struct xdr_netobj *read_token)
+/* Check the MIC token only; the caller decides about the lifetime. */
+static u32
+gss_krb5_check_mic_v2(struct krb5_ctx *ctx, struct xdr_buf *message_buffer,
+		      struct xdr_netobj *read_token)
 {
 	const struct krb5_enctype *krb5 = ctx->krb5e;
 	struct crypto_shash *shash = ctx->initiate ?
@@ -82,7 +83,6 @@ gss_krb5_verify_mic_v2(struct krb5_ctx *ctx, struct xdr_buf *message_buffer,
 	size_t mic_offset, mic_len;
 	u8 *ptr = read_token->data;
 	__be16 be16_ptr;
-	time64_t now;
 	u8 flags;
 	int nsg, i;
 	int ret;
@@ -125,15 +125,49 @@ gss_krb5_verify_mic_v2(struct krb5_ctx *ctx, struct xdr_buf *message_buffer,
 	if (ret)
 		return gss_krb5_errno_to_status(ret);
 
-	/* it got through unscathed.  Make sure the context is unexpired */
-	now = ktime_get_real_seconds();
-	if (now > ctx->endtime)
-		return GSS_S_CONTEXT_EXPIRED;
-
 	/*
 	 * NOTE: the sequence number at ptr + 8 is skipped, rpcsec_gss
 	 * doesn't want it checked; see page 6 of rfc 2203.
 	 */
 
 	return GSS_S_COMPLETE;
+}
+
+u32
+gss_krb5_verify_mic_v2(struct krb5_ctx *ctx, struct xdr_buf *message_buffer,
+		       struct xdr_netobj *read_token)
+{
+	u32 maj_stat = gss_krb5_check_mic_v2(ctx, message_buffer, read_token);
+
+	if (maj_stat != GSS_S_COMPLETE)
+		return maj_stat;
+
+	/* it got through unscathed.  Make sure the context is unexpired */
+	if (ktime_get_real_seconds() > ctx->endtime)
+		return GSS_S_CONTEXT_EXPIRED;
+	return GSS_S_COMPLETE;
+}
+
+/* As gss_krb5_verify_mic_v2(), but report a verified token separately
+ * from the context lifetime. */
+struct gss_rx_result
+gss_krb5_verify_mic_v2_reply(struct krb5_ctx *ctx,
+			     struct xdr_buf *message_buffer,
+			     struct xdr_netobj *read_token)
+{
+	struct gss_rx_result res = {
+		.major_status = gss_krb5_check_mic_v2(ctx, message_buffer,
+						      read_token),
+		.verdict = GSS_RX_INVALID,
+	};
+
+	if (res.major_status != GSS_S_COMPLETE)
+		return res;
+	if (ktime_get_real_seconds() > ctx->endtime) {
+		res.major_status = GSS_S_CONTEXT_EXPIRED;
+		res.verdict = GSS_RX_VERIFIED_EXPIRED;
+	} else {
+		res.verdict = GSS_RX_VERIFIED;
+	}
+	return res;
 }

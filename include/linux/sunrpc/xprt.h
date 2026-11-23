@@ -53,6 +53,36 @@ struct net;
 /*
  * This describes a complete RPC request
  */
+/*
+ * RPCSEC_GSS expired-reply exception.  A clock reading taken from one
+ * timekeeper snapshot: REALTIME plus the clock-was-set generation, and
+ * BOOTTIME read right after it.
+ */
+struct rpc_gss_clock {
+	s64			real_ns;
+	u64			boot_ns;
+	u32			clock_set_seq;
+	bool			valid;
+};
+
+/* When the complete record carrying one encoded GSS sequence number was
+ * first accepted by the local TCP socket.  @queued is set last. */
+struct rpc_gss_tx_stamp {
+	bool			queued;
+	struct rpc_gss_clock	clock;
+};
+
+/* Verification state of the reply being decoded. */
+struct rpc_gss_rx_state {
+	u32			verified_seqno;	/* matched by the verifier */
+	bool			header_verified;
+	bool			body_verified;	/* krb5i MIC / krb5p unwrap */
+	bool			expired_seen;	/* exception candidate */
+	bool			retry_expired_reply;
+					/* exception failed: renew the
+					 * credential and resend */
+};
+
 struct rpc_rqst {
 	/*
 	 * This is the user-visible part
@@ -70,6 +100,14 @@ struct rpc_rqst {
 	int			rq_cong;	/* has incremented xprt->cong */
 	u32			rq_seqnos[RPC_GSS_SEQNO_ARRAY_SIZE];	/* past gss req seq nos. */
 	unsigned int		rq_seqno_count;	/* number of entries in rq_seqnos */
+	struct rpc_gss_tx_stamp	rq_gss_tx[RPC_GSS_SEQNO_ARRAY_SIZE];
+					/* parallel to rq_seqnos[] */
+	struct rpc_gss_rx_state	rq_gss_rx;
+	bool			rq_verf_provisional;
+					/* verifier accepted only for an
+					 * expired context: a successful
+					 * reply may still complete, nothing
+					 * else may */
 	int			rq_enc_pages_num;
 	struct page		**rq_enc_pages;	/* scratch pages for use by
 						   gss privacy code */
@@ -135,9 +173,15 @@ static inline int xprt_rqst_add_seqno(struct rpc_rqst *req, u32 seqno)
 	/* Shift array to make room for the newest element at the beginning */
 	memmove(&req->rq_seqnos[1], &req->rq_seqnos[0],
 		(RPC_GSS_SEQNO_ARRAY_SIZE - 1) * sizeof(req->rq_seqnos[0]));
+	memmove(&req->rq_gss_tx[1], &req->rq_gss_tx[0],
+		(RPC_GSS_SEQNO_ARRAY_SIZE - 1) * sizeof(req->rq_gss_tx[0]));
 	req->rq_seqnos[0] = seqno;
+	memset(&req->rq_gss_tx[0], 0, sizeof(req->rq_gss_tx[0]));
 	return 0;
 }
+
+void xprt_gss_clock_sample(struct rpc_gss_clock *clk);
+void xprt_rqst_note_record_queued(struct rpc_rqst *req);
 
 /* RPC transport layer security policies */
 enum xprtsec_policies {
